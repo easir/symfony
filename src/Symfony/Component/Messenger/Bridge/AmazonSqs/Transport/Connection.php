@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Messenger\Bridge\AmazonSqs\Transport;
 
+use AsyncAws\S3\S3Client;
 use AsyncAws\Sqs\Enum\MessageSystemAttributeName;
 use AsyncAws\Sqs\Enum\QueueAttributeName;
 use AsyncAws\Sqs\Result\ReceiveMessageResult;
@@ -33,6 +34,7 @@ class Connection
 {
     private const AWS_SQS_FIFO_SUFFIX = '.fifo';
     private const MESSAGE_ATTRIBUTE_NAME = 'X-Symfony-Messenger';
+    private const S3_CHECKSUM_SHA256_ATTRIBUTE_NAME = 'X-S3-Checksum-Sha256';
 
     private const DEFAULT_OPTIONS = [
         'buffer_size' => 9,
@@ -49,10 +51,12 @@ class Connection
         'account' => null,
         'sslmode' => null,
         'debug' => null,
+        'large_payload_support' => null,
     ];
 
     private array $configuration;
     private SqsClient $client;
+    private S3Client $s3Client;
     private ?ReceiveMessageResult $currentResponse = null;
     /** @var array[] */
     private array $buffer = [];
@@ -61,9 +65,11 @@ class Connection
         array $configuration,
         ?SqsClient $client = null,
         private ?string $queueUrl = null,
+        ?S3Client $s3Client = null,
     ) {
         $this->configuration = array_replace_recursive(self::DEFAULT_OPTIONS, $configuration);
         $this->client = $client ?? new SqsClient([]);
+        $this->s3Client = $s3Client ?? new S3Client([]);
     }
 
     public function __sleep(): array
@@ -100,6 +106,7 @@ class Connection
      * * sslmode: Can be "disable" to use http for a custom endpoint
      * * auto_setup: Whether the queue should be created automatically during send / get (Default: true)
      * * debug: Log all HTTP requests and responses as LoggerInterface::DEBUG (Default: false)
+     * * large_payload_support: S3 bucket the transport should use for messages larger than 256KB
      */
     public static function fromDsn(#[\SensitiveParameter] string $dsn, array $options = [], ?HttpClientInterface $client = null, ?LoggerInterface $logger = null): self
     {
@@ -147,6 +154,8 @@ class Connection
         }
         unset($query['region']);
 
+        $s3Client = new S3Client($clientConfiguration, null, $client, $logger);
+
         if ('default' !== ($params['host'] ?? 'default')) {
             $clientConfiguration['endpoint'] = \sprintf('%s://%s%s', ($options['sslmode'] ?? null) === 'disable' ? 'http' : 'https', $params['host'], ($params['port'] ?? null) ? ':'.$params['port'] : '');
             if (preg_match(';^sqs\.([^\.]++)\.amazonaws\.com$;', $params['host'], $matches)) {
@@ -173,7 +182,7 @@ class Connection
             $queueUrl = 'https://'.$params['host'].$params['path'];
         }
 
-        return new self($configuration, new SqsClient($clientConfiguration, null, $client, $logger), $queueUrl);
+        return new self($configuration, new SqsClient($clientConfiguration, null, $client, $logger), $queueUrl, $s3Client);
     }
 
     public function get(): ?array
@@ -243,6 +252,18 @@ class Connection
                 $headers = json_decode($attributes[self::MESSAGE_ATTRIBUTE_NAME]->getStringValue(), true);
                 unset($attributes[self::MESSAGE_ATTRIBUTE_NAME]);
             }
+
+            $s3Key = null;
+            $body = $message->getBody();
+            if (isset($attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]) && 'String' === $attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]->getDataType()) {
+                $object = $this->s3Client->getObject([
+                    'Key' => $body,
+                    'Bucket' => $this->configuration['large_payload_support'],
+                    'ChecksumSHA256' => $attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]->getStringValue(),
+                ]);
+                $body = $object->getBody();
+            }
+
             foreach ($attributes as $name => $attribute) {
                 if ('String' !== $attribute->getDataType()) {
                     continue;
@@ -253,8 +274,9 @@ class Connection
 
             $this->buffer[] = [
                 'id' => $message->getReceiptHandle(),
-                'body' => $message->getBody(),
+                'body' => $body,
                 'headers' => $headers,
+                's3-key' => $s3Key,
             ];
         }
 
@@ -291,16 +313,33 @@ class Connection
         // Blocking call to wait for the queue to be created
         $exists->wait();
         if (!$exists->isSuccess()) {
-            throw new TransportException(\sprintf('Failed to create the Amazon SQS queue "%s".', $this->configuration['queue_name']));
+            throw new TransportException(sprintf('Failed to create the Amazon SQS queue "%s".', $this->configuration['queue_name']));
         }
         $this->queueUrl = null;
+
+        if (null !== $this->configuration['large_payload_support'] && !$this->s3Client->bucketExists($this->configuration['large_payload_support'])) {
+            throw new TransportException(sprintf('The Amazon S3 bucket "%s" does not exist.', $this->configuration['large_payload_support']));
+        }
     }
 
-    public function delete(string $id): void
+    public function delete(string $id, ?string $s3Key): void
     {
+        if (null !== $s3Key && null === $this->configuration['large_payload_support']) {
+            throw new TransportException('The Amazon S3 bucket is not configured.');
+        }
+
         $this->client->deleteMessage([
             'QueueUrl' => $this->getQueueUrl(),
             'ReceiptHandle' => $id,
+        ]);
+
+        if (null === $s3Key) {
+            return;
+        }
+
+        $this->s3Client->deleteObject([
+            'Bucket' => $this->configuration['large_payload_support'],
+            'Key' => $s3Key,
         ]);
     }
 
@@ -333,7 +372,7 @@ class Connection
         return (int) ($attributes[QueueAttributeName::APPROXIMATE_NUMBER_OF_MESSAGES] ?? 0);
     }
 
-    public function send(string $body, array $headers, int $delay = 0, ?string $messageGroupId = null, ?string $messageDeduplicationId = null, ?string $xrayTraceId = null): void
+    public function send(string $body, array $headers, int $delay = 0, ?string $messageGroupId = null, ?string $messageDeduplicationId = null, ?string $xrayTraceId = null, ?string $s3Key = null): void
     {
         if ($this->configuration['auto_setup']) {
             $this->setup();
@@ -374,6 +413,21 @@ class Connection
                 'DataType' => 'String',
                 'StringValue' => $xrayTraceId,
             ]);
+        }
+
+        if (null !== $this->configuration['large_payload_support'] && null !== $s3Key) {
+            $messageSha256 = hash('sha256', $body);
+            $parameters['MessageAttributes'][self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME] = new MessageAttributeValue([
+                'DataType' => 'String',
+                'StringValue' => $messageSha256,
+            ]);
+            $this->s3Client->putObject([
+                'Bucket' => $this->configuration['large_payload_support'],
+                'ChecksumSHA256' => $messageSha256,
+                'Key' => $s3Key,
+                'Body' => $body,
+            ]);
+            $parameters['MessageBody'] = $s3Key;
         }
 
         if (self::isFifoQueue($this->configuration['queue_name'])) {
@@ -419,5 +473,10 @@ class Connection
     private static function isFifoQueue(string $queueName): bool
     {
         return str_ends_with($queueName, self::AWS_SQS_FIFO_SUFFIX);
+    }
+
+    public function supportsLargePayload(): bool
+    {
+        return null !== $this->configuration['large_payload_support'];
     }
 }

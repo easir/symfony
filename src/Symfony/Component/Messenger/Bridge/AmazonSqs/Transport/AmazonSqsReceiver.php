@@ -52,9 +52,13 @@ class AmazonSqsReceiver implements KeepaliveReceiverInterface, MessageCountAware
                 'headers' => $sqsEnvelope['headers'],
             ]);
         } catch (MessageDecodingFailedException $exception) {
-            $this->connection->delete($sqsEnvelope['id']);
+            $this->connection->delete($sqsEnvelope['id'], $sqsEnvelope['s3-key'] ?? null);
 
             throw $exception;
+        }
+
+        if (array_key_exists('s3-key', $sqsEnvelope)) {
+            $envelope = $envelope->with(new AmazonS3KeyStamp($sqsEnvelope['s3-key']));
         }
 
         yield $envelope->with(new AmazonSqsReceivedStamp($sqsEnvelope['id']));
@@ -63,7 +67,8 @@ class AmazonSqsReceiver implements KeepaliveReceiverInterface, MessageCountAware
     public function ack(Envelope $envelope): void
     {
         try {
-            $this->connection->delete($this->findSqsReceivedStamp($envelope)->getId());
+            $s3KeyStamp = $envelope->last(AmazonS3KeyStamp::class);
+            $this->connection->delete($this->findSqsReceivedStamp($envelope)->getId(), $s3KeyStamp?->getKey());
         } catch (HttpException $e) {
             throw new TransportException($e->getMessage(), 0, $e);
         }
@@ -72,7 +77,8 @@ class AmazonSqsReceiver implements KeepaliveReceiverInterface, MessageCountAware
     public function reject(Envelope $envelope): void
     {
         try {
-            $this->connection->delete($this->findSqsReceivedStamp($envelope)->getId());
+            $s3ObjectStamp = $envelope->last(AmazonS3KeyStamp::class);
+            $this->connection->delete($this->findSqsReceivedStamp($envelope)->getId(), $s3ObjectStamp?->getKey());
         } catch (HttpException $e) {
             throw new TransportException($e->getMessage(), 0, $e);
         }

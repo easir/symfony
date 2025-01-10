@@ -52,6 +52,15 @@ class AmazonSqsSender implements SenderInterface
         $amazonSqsXrayTraceHeaderStamp = $envelope->last(AmazonSqsXrayTraceHeaderStamp::class);
         $xrayTraceId = $amazonSqsXrayTraceHeaderStamp?->getTraceId();
 
+        $s3Key = null;
+        if (strlen($encodedMessage['body']) > 256 * 1024) {
+            if (false === $this->connection->supportsLargePayload()) {
+                throw new TransportException('The message is larger than 256KB to be sent to Amazon SQS, turn on the "large_payload_support" option to enable storing large message in Amazon S3.');
+            }
+
+            $s3Key = hash('sha256', $encodedMessage['body'] . microtime(true));
+        }
+
         try {
             $this->connection->send(
                 $encodedMessage['body'],
@@ -59,7 +68,8 @@ class AmazonSqsSender implements SenderInterface
                 $delay,
                 $messageGroupId,
                 $messageDeduplicationId,
-                $xrayTraceId
+                $xrayTraceId,
+                $s3Key,
             );
         } catch (HttpException $e) {
             throw new TransportException($e->getMessage(), 0, $e);
