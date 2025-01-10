@@ -318,7 +318,7 @@ class Connection
         $this->queueUrl = null;
 
         if (null !== $this->configuration['large_payload_support'] && !$this->s3Client->bucketExists($this->configuration['large_payload_support'])) {
-            throw new TransportException(sprintf('The Amazon S3 bucket "%s" does not exist.', $this->configuration['large_payload_support']));
+            throw new TransportException(\sprintf('The Amazon S3 bucket "%s" does not exist.', $this->configuration['large_payload_support']));
         }
     }
 
