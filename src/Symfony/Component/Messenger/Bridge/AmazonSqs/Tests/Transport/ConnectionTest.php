@@ -199,6 +199,15 @@ class ConnectionTest extends TestCase
         );
     }
 
+    public function testFromDsnWithLargePayloadSupport()
+    {
+        $httpClient = $this->createMock(HttpClientInterface::class);
+        $this->assertEquals(
+            new Connection(['queue_name' => 'queue', 'large_payload_support' => 'S3_BUCKET_NAME'], new SqsClient(['region' => 'eu-west-1', 'accessKeyId' => null, 'accessKeySecret' => null], null, $httpClient)),
+            Connection::fromDsn('sqs://default/queue?large_payload_support=S3_BUCKET_NAME', [], $httpClient)
+        );
+    }
+
     public function testFromDsnWithInvalidQueryString()
     {
         $this->expectException(\InvalidArgumentException::class);

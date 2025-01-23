@@ -255,7 +255,7 @@ class Connection
 
             $s3Key = null;
             $body = $message->getBody();
-            if (isset($attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]) && 'String' === $attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]->getDataType()) {
+            if (isset($attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]) && $attributes[self::S3_CHECKSUM_SHA256_ATTRIBUTE_NAME]->getDataType() === 'String') {
                 $object = $this->s3Client->getObject([
                     'Key' => $body,
                     'Bucket' => $this->configuration['large_payload_support'],
@@ -265,7 +265,7 @@ class Connection
             }
 
             foreach ($attributes as $name => $attribute) {
-                if ('String' !== $attribute->getDataType()) {
+                if ($attribute->getDataType() !== 'String') {
                     continue;
                 }
 
@@ -322,7 +322,7 @@ class Connection
         }
     }
 
-    public function delete(string $id, ?string $s3Key): void
+    public function delete(string $id, ?string $s3Key = null): void
     {
         if (null !== $s3Key && null === $this->configuration['large_payload_support']) {
             throw new TransportException('The Amazon S3 bucket is not configured.');

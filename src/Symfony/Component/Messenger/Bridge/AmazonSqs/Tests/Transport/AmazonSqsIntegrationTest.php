@@ -75,7 +75,12 @@ class AmazonSqsIntegrationTest extends TestCase
     private function clearSqs(string $dsn): void
     {
         $url = parse_url($dsn);
-        $client = new SqsClient(['endpoint' => "http://{$url['host']}:{$url['port']}"]);
+        if (array_key_exists('port', $url)) {
+            $client = new SqsClient(['endpoint' => "http://{$url['host']}:{$url['port']}"]);
+        } else {
+            $client = new SqsClient(['endpoint' => "{$url['scheme']}://{$url['host']}"]);
+        }
+
         $client->purgeQueue([
             'QueueUrl' => $client->getQueueUrl(['QueueName' => ltrim($url['path'], '/')])->getQueueUrl(),
         ]);
